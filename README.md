@@ -47,7 +47,7 @@ Recent benchmark results on A100 clusters:
 
 Single-host A100x8
 | Model Size | MFU   |
-|------------|-------|
+| ---------- | ----- |
 | 84m        | 14    |
 | 270m       | 24    |
 | 540m       | 35    |
@@ -55,10 +55,10 @@ Single-host A100x8
 | 2b         | 50.66 |
 
 On 4 A100x8 hosts connected with infiniband
-| Model Size | MFU   |
-|------------|-------|
-| 1b         | 32.4  |
-| 2b         | 39.0  |
+| Model Size | MFU  |
+| ---------- | ---- |
+| 1b         | 32.4 |
+| 2b         | 39.0 |
 
 ## Data loaders
 

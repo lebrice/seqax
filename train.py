@@ -1,28 +1,36 @@
 """Main training loop, including the model, loss function, and optimizer."""
+
 import operator
 import os
 import time
 
 import env
 
-env.set_variables()
+env.set_variables()  # noqa
 import shardlib.shardtypes as shardtypes
 
-shardtypes.register_with_typeguard()
+# WHY does this need to be here?
+shardtypes.register_with_typeguard()  # noqa
 import datetime
 import math
 from dataclasses import dataclass
 from functools import cached_property, partial
 from typing import Any, Optional, Tuple, Union
 
+import einops
 import hydra
 import jax
 import jax.numpy as jnp
+from clearml import Task
 from jax import lax
-from jax.sharding import PartitionSpec
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh, PartitionSpec
+from jax.tree_util import tree_leaves
 from typeguard import typechecked
 
+import jax_extra
 import shardlib.shardops as shardops
+import training_io
 from input_loader import (
     FlatTokensParams,
     HuggingFaceDataParams,
@@ -30,6 +38,7 @@ from input_loader import (
     TokenBatchParams,
     get_loader,
 )
+from jax_extra import explicit_activation_checkpointing, fold_in_str, save_for_backward
 from shardlib.shardtypes import (
     Array,
     bf16,
@@ -39,18 +48,6 @@ from shardlib.shardtypes import (
     pytree_dataclass,
     u32,
 )
-
-import os
-
-import einops
-from clearml import Task
-from jax.experimental import mesh_utils
-from jax.sharding import Mesh
-from jax.tree_util import tree_leaves
-
-import jax_extra
-import training_io
-from jax_extra import explicit_activation_checkpointing, fold_in_str, save_for_backward
 
 P = PartitionSpec
 PRNGKey = Any
@@ -70,8 +67,8 @@ class Hparams:
 
 @pytree_dataclass
 class TransformerLayer:
-    ln1: f32["d_model/t/d"]
-    ln2: f32["d_model/t/d"]
+    ln1: f32[" d_model/t/d"]
+    ln2: f32[" d_model/t/d"]
     w_q: f32["d_model/d n_q_per_kv n_kv/t d_head"]
     w_kv: f32["2 d_model/d n_kv/t d_head"]
     w_o: f32["d_model/d n_q_per_kv n_kv/t d_head"]
@@ -459,9 +456,9 @@ def training_step(
             tree_leaves(state.adam_nu),
             tree_leaves(shardtypes.make_partition_specs(State)),
         ):
-            assert shardtypes.is_fully_sharded(
-                spec
-            ), "Weight update is only correctly scaled for fully sharded weights."
+            assert shardtypes.is_fully_sharded(spec), (
+                "Weight update is only correctly scaled for fully sharded weights."
+            )
             # Gradient clipping
             g = g * rescale
             # Adam scaling
@@ -523,12 +520,12 @@ class Config:
     hf_dataset: Optional[HuggingFaceDataParams] = None
 
     def __post_init__(self):
-        assert (
-            self.flat_tokens is not None or self.hf_dataset is not None
-        ), "Must provide either flat_tokens or hf_dataset."
-        assert not (
-            self.flat_tokens is not None and self.hf_dataset is not None
-        ), "Should not specify both flat_tokens and hf_dataset."
+        assert self.flat_tokens is not None or self.hf_dataset is not None, (
+            "Must provide either flat_tokens or hf_dataset."
+        )
+        assert not (self.flat_tokens is not None and self.hf_dataset is not None), (
+            "Should not specify both flat_tokens and hf_dataset."
+        )
 
     @cached_property
     def training_data(self) -> Union[FlatTokensParams, HuggingFaceDataParams]:
@@ -550,9 +547,9 @@ def main_contained(config, logger):
         root_rng = jax.random.PRNGKey(config.training.seed)
 
         loader = get_loader("train", config.training_data, config.training.tokens)
-        assert (
-            config.model.vocab > loader.max_token_id
-        ), f"{config.model.vocab} vs {loader.max_token_id}"
+        assert config.model.vocab > loader.max_token_id, (
+            f"{config.model.vocab} vs {loader.max_token_id}"
+        )
 
         model_dir = os.path.join(config.paths.root_working_dir, config.paths.model_name)
         training_io.mkdir(model_dir)

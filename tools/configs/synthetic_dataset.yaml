@@ -1,5 +1,5 @@
 defaults:
-- config_schema
+  - synthetic_dataset_schema
 
 seed: 1
 seq_len: 1024
