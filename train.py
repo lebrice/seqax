@@ -2,6 +2,7 @@
 
 import operator
 import os
+from pathlib import Path
 import time
 
 import env
@@ -532,7 +533,7 @@ class Config:
         return self.flat_tokens or self.hf_dataset
 
 
-def main_contained(config, logger):
+def main_contained(config: Config, logger):
     """Main program, which does not access external services except as specified by config.paths or logger."""
     # Use partitionable (and hopefully fusable!) RNG.
     #
@@ -566,6 +567,7 @@ def main_contained(config, logger):
             state, jnp.uint32(0), config.model, config.training, loader.load(0)
         ).compile()
         date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        Path(model_dir).mkdir(parents=True, exist_ok=True)
         training_io.save_hlo_svg(
             os.path.join(model_dir, f"training_step_optimized_hlo_{date}.svg"),
             c_training_step,
