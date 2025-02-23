@@ -2,12 +2,12 @@
 #   XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000
 
 defaults:
-- base
-- _self_
+  - base
+  - _self_
 
 training:
   warmup_steps: 10
-  steps:        50
+  steps: 50
   steps_for_lr: 100
   tokens:
     batch: 64
@@ -24,7 +24,7 @@ model:
   rope_max_timescale: 256
 
 paths:
-  root_working_dir: '/tmp'
+  root_working_dir: "/scratch/n/normandf/logs"
 
 checkpoint_interval: 10
 num_hosts: 1
@@ -34,7 +34,7 @@ mesh:
   t: 2
 
 flat_tokens:
-  filespec: 'synthetic_dataset.zarr'
+  filespec: "synthetic_dataset.zarr"
   streams: 2
   read_blocks_per_shuffle_buffer: 8
   sequences_per_read_block: 16
