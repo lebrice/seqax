@@ -1,42 +1,34 @@
 """Main training loop, including the model, loss function, and optimizer."""
 
 import dataclasses
+import datetime
 import functools
+import logging
+import math
 import operator
 import os
-from pathlib import Path
 import time
-
-import clearml
-import omegaconf
-import yaml
-
-import env
-
-env.set_variables()  # noqa
-import shardlib.shardtypes as shardtypes
-
-# WHY does this need to be here?
-shardtypes.register_with_typeguard()  # noqa
-import datetime
-import math
 from dataclasses import dataclass
 from functools import cached_property, partial
+from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union
 
 import einops
-import hydra
 import jax
 import jax.numpy as jnp
-from clearml import Task
+import omegaconf
+import rich.logging
 from jax import lax
+from jax._src.distributed import initialize as jax_distributed_initialize
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, PartitionSpec
 from jax.tree_util import tree_leaves
 from typeguard import typechecked
+import yaml
 
 import jax_extra
 import shardlib.shardops as shardops
+import shardlib.shardtypes as shardtypes
 import training_io
 from input_loader import (
     FlatTokensParams,
@@ -56,6 +48,16 @@ from shardlib.shardtypes import (
     u32,
 )
 
+# NOTE: Removed this. Seems to be specific to TPUs (who even has those except Google?!)
+# import env
+# env.set_variables()  # noqa
+
+
+# TODO: Double-check that we can get away with adding this here.
+shardtypes.register_with_typeguard()  # noqa
+
+log = logging.getLogger(__name__)
+
 
 def multiply(numbers: Iterable[Any]):
     return functools.reduce(operator.mul, numbers)
@@ -65,6 +67,60 @@ omegaconf.OmegaConf.register_new_resolver("eval", eval)
 omegaconf.OmegaConf.register_new_resolver("mul", lambda *numbers: multiply(numbers))
 P = PartitionSpec
 PRNGKey = Any
+
+
+def get_gpus_per_task(tres_per_task: str) -> int:
+    """Returns the number of GPUS per task from the SLURM env variables.
+
+    >>> get_gpus_per_task('cpu=48,gres/gpu=4')
+    4
+    >>> get_gpus_per_task('cpu=48,gres/gpu=h100=2')
+    2
+    >>> get_gpus_per_task('cpu=48')
+    0
+    >>> get_gpus_per_task('cpu=48,gres/gpu:h100=4')
+    """
+    # todo: figure out how many GPUS per task given the tres_per_task.
+    # Example: 'cpu=48,gres/gpu=4' --> 4
+    # Example: 'cpu=48,gres/gpu=h100:4' --> 4
+    for part in tres_per_task.split(","):
+        res_type, _, res_count = part.partition(":")
+        if res_type == "gres/gpu":
+            gpus_per_task = int(res_count.rpartition("=")[-1])
+            assert gpus_per_task > 0
+            return gpus_per_task
+    return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class SlurmDistributedConfig:
+    global_rank: int = dataclasses.field(
+        default_factory=lambda: int(os.environ["SLURM_PROCID"])
+    )
+    local_rank: int = dataclasses.field(
+        default_factory=lambda: int(os.environ["SLURM_LOCALID"])
+    )
+    num_tasks: int = dataclasses.field(
+        default_factory=lambda: int(os.environ["SLURM_NTASKS"])
+    )
+    num_nodes: int = dataclasses.field(
+        default_factory=lambda: int(os.environ["SLURM_JOB_NUM_NODES"])
+    )
+    ntasks_per_node: int = dataclasses.field(
+        default_factory=lambda: int(os.environ["SLURM_NTASKS_PER_NODE"])
+    )
+    cpus_per_task: int = dataclasses.field(
+        default_factory=lambda: int(os.environ["SLURM_CPUS_PER_TASK"])
+    )
+    gpus_per_task: int = dataclasses.field(
+        default_factory=lambda: get_gpus_per_task(os.environ["SLURM_TRES_PER_TASK"])
+    )
+    node_id: int = dataclasses.field(
+        default_factory=lambda: int(os.environ["SLURM_NODEID"])
+    )
+    node_list: tuple[str, ...] = dataclasses.field(
+        default_factory=lambda: tuple(os.environ["SLURM_JOB_NODELIST"].split(","))
+    )
 
 
 @dataclass(frozen=True)
@@ -175,7 +231,9 @@ class Model:
             final_layer_norm=final_layer_norm,
         )
         shardings = make_shardings(Model)
-        return jax.tree.map(lax.with_sharding_constraint, arrays, shardings)
+        sharded = jax.tree.map(lax.with_sharding_constraint, arrays, shardings)
+        assert isinstance(sharded, Model)
+        return sharded
 
     @typechecked
     def forward_pass(
@@ -412,12 +470,12 @@ def training_step(
     hparams: TrainingHparams,
     batch: TokenBatch,
 ) -> Tuple[Any, Metrics]:
-    @partial(
-        shardtypes.typed_shard_map, check_rep=False
-    )  # check_rep=False for https://github.com/google/jax/issues/20335
+    # check_rep=False for https://github.com/google/jax/issues/20335
+    @partial(shardtypes.typed_shard_map, check_rep=False)
     def sharded_step(
         state: State, step: u32[b""], batch: TokenBatch
     ) -> Tuple[State, Metrics]:
+        # TODO: Very ugly.
         loss, grad = jax.value_and_grad(lambda weights: weights.loss(h, batch))(
             state.weights
         )
@@ -546,13 +604,103 @@ class Config:
         return self.flat_tokens or self.hf_dataset
 
 
-def main_contained(config: Config, logger: clearml.Logger | None):
-    """Main program, which does not access external services except as specified by config.paths or logger."""
-    # Use partitionable (and hopefully fusable!) RNG.
-    #
-    # This is slower in compute time than 'unsafe_rbg' with flag '--xla_tpu_spmd_rng_bit_generator_unsafe=true',
-    # but hopefully faster in memory time because it's fusable.
-    # TODO: check this is true and if not, provide our own that actually is fusable.
+def setup_logging(local_rank: int, num_processes: int, verbose: int):
+    logging.basicConfig(
+        level=logging.INFO,
+        # Add the [{local_rank}/{num_processes}] prefix to log messages
+        format=f"[%(asctime)s][%(levelname)s][{local_rank + 1}/{num_processes}] %(message)s",
+        handlers=[rich.logging.RichHandler()],
+    )
+    if verbose == 0:
+        log.setLevel(logging.ERROR)
+    elif verbose == 1:
+        log.setLevel(logging.WARNING)
+    elif verbose == 2:
+        log.setLevel(logging.INFO)
+    else:
+        assert verbose >= 3
+        log.setLevel(logging.DEBUG)
+
+
+# todo: the type hints here SUCK. Not using it yet.
+# @auto_config
+# def make_config(world_size: int):
+#     return Config(...)
+
+
+def main():
+    # Rewrite of `main` / `main_contained`.
+    distributed_config = SlurmDistributedConfig()
+    config = Config(
+        model=Hparams(
+            d_model=4096,
+            n_q_per_kv=1,
+            n_kv=16,
+            d_head=128,
+            layers=8,
+            d_ff=16384,
+            vocab=32768,
+            rope_max_timescale=10000,
+        ),
+        training=TrainingHparams(
+            # AdamW optimizer parameters
+            # We use AdamW following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
+            adam_b1=0.9,  # Exponential decay rate to track the first moment of past gradients.
+            adam_b2=0.95,  # Exponential decay rate to track the second moment of past gradients.
+            adam_eps=1.0e-8,  # A small constant applied to denominator outside of the square root.
+            adam_eps_root=0.0,  # A small constant applied to denominator inside the square root.
+            weight_decay=0.1,  # AdamW Weight decay
+            # We take inspiration from Llama2's learning rate (LR) schedule, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
+            # Learning rate schedule has two parts:
+            # 1) Linear warmup from 0 to [learning_rate] over steps 0 to [learning_rate_schedule_steps * warmup_steps_fraction]
+            # 2) Cosine decay from [learning_rate] to [learning_rate * cosine_learning_rate_final_fraction] from warmup to learning_rate_schedule_steps
+            # learning_rate=3.e-5,
+            cosine_learning_rate_final_fraction=0.1,
+            seed=0,
+            warmup_steps=18500,
+            steps=185000,
+            steps_for_lr=185000,
+            learning_rate=1.0e-5,
+            tokens=TokenBatchParams(
+                batch=64,
+                len=1024,
+            ),
+            # queue="yes",  # ?
+        ),
+        num_hosts=distributed_config.num_tasks,
+        paths=Paths(
+            root_working_dir=str(Path(os.environ["SCRATCH"]) / "logs"),
+            model_name=os.environ.get("SLURM_JOB_NAME", "default"),
+        ),
+        mesh=MeshConfig(
+            # todo: play around with different d/t ratios for a fixed number of GPUs?
+            d=(distributed_config.gpus_per_task * distributed_config.num_tasks),
+            t=1,
+        ),
+        checkpoint_interval=2500,
+        io=training_io.IOConfig(max_io_threads=1024),
+        hf_dataset=HuggingFaceDataParams(
+            path="wikitext",
+            name="wikitext-103-v1",
+            tokenizer="gpt2",
+            num_workers=distributed_config.cpus_per_task,
+            sequences_packed_per_batch=120,
+        ),
+    )
+    assert distributed_config.gpus_per_task > 0, os.environ["SLURM_TRES_PER_TASK"]
+    # Using `jax.distributed.initialize` shows an import warning in VsCode+Pylance saying
+    # it isn't defined there.
+    # BUG: Seems like it's necessary to pass this list otherwise the GPUS aren't split correctly.
+    jax_distributed_initialize(
+        local_device_ids=list(range(distributed_config.gpus_per_task))
+    )
+    setup_logging(distributed_config.global_rank, distributed_config.num_tasks, 3)
+    if distributed_config.global_rank == 0:
+        log.info(yaml.dump(dataclasses.asdict(distributed_config), indent=2))
+        log.info(yaml.dump(dataclasses.asdict(config), indent=2))
+        # todo: wandb init here.
+
+    # what is this? Why is it here?
     jax.config.update("jax_threefry_partitionable", True)
     with Mesh(
         mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t], jax.devices()),
@@ -565,9 +713,9 @@ def main_contained(config: Config, logger: clearml.Logger | None):
         assert config.model.vocab > loader.max_token_id, (
             f"{config.model.vocab} vs {loader.max_token_id}"
         )
-
         model_dir = Path(config.paths.root_working_dir) / config.paths.model_name
         training_io.mkdir(str(model_dir))
+
         state = jax.jit(partial(State.init, config.model))(
             fold_in_str(root_rng, "init")
         )
@@ -620,112 +768,7 @@ def main_contained(config: Config, logger: clearml.Logger | None):
                     f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
                 )
 
-            training_io.log(step, logger, output)
-
-
-WORLD_SIZE = int(os.environ["SLURM_JOB_NUM_NODES"]) * int(
-    os.environ["SLURM_NTASKS_PER_NODE"]
-)
-
-config = Config(
-    model=Hparams(
-        d_model=4096,
-        n_q_per_kv=1,
-        n_kv=16,
-        d_head=128,
-        layers=8,
-        d_ff=16384,
-        vocab=32768,
-        rope_max_timescale=10000,
-    ),
-    training=TrainingHparams(
-        # AdamW optimizer parameters
-        # We use AdamW following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
-        adam_b1=0.9,  # Exponential decay rate to track the first moment of past gradients.
-        adam_b2=0.95,  # Exponential decay rate to track the second moment of past gradients.
-        adam_eps=1.0e-8,  # A small constant applied to denominator outside of the square root.
-        adam_eps_root=0.0,  # A small constant applied to denominator inside the square root.
-        weight_decay=0.1,  # AdamW Weight decay
-        # We take inspiration from Llama2's learning rate (LR) schedule, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
-        # Learning rate schedule has two parts:
-        # 1) Linear warmup from 0 to [learning_rate] over steps 0 to [learning_rate_schedule_steps * warmup_steps_fraction]
-        # 2) Cosine decay from [learning_rate] to [learning_rate * cosine_learning_rate_final_fraction] from warmup to learning_rate_schedule_steps
-        # learning_rate=3.e-5,
-        cosine_learning_rate_final_fraction=0.1,
-        seed=0,
-        warmup_steps=18500,
-        steps=185000,
-        steps_for_lr=185000,
-        learning_rate=1.0e-5,
-        tokens=TokenBatchParams(
-            batch=64,
-            len=1024,
-        ),
-        # queue="yes",  # ?
-    ),
-    num_hosts=WORLD_SIZE,
-    paths=Paths(
-        root_working_dir=str(Path(os.environ["SCRATCH"]) / "logs"),
-        model_name=os.environ.get("SLURM_JOB_NAME", "default"),
-    ),
-    mesh=MeshConfig(
-        d=WORLD_SIZE,
-        t=1,
-    ),
-    checkpoint_interval=2500,
-    io=training_io.IOConfig(max_io_threads=1024),
-    hf_dataset=HuggingFaceDataParams(
-        path="wikitext",
-        name="wikitext-103-v1",
-        tokenizer="gpt2",
-        num_workers=48,
-        sequences_packed_per_batch=120,
-    ),
-)
-
-
-def get_gpus_per_task(tres_per_task: str) -> int:
-    """Returns the number of GPUS per task from the SLURM env variables.
-
-    >>> get_gpus_per_task('cpu=48,gres/gpu=4')
-    4
-    >>> get_gpus_per_task('cpu=48,gres/gpu=h100:2')
-    2
-    >>> get_gpus_per_task('cpu=48')
-    0
-    """
-    # todo: figure out how many GPUS per task given the tres_per_task.
-    # Example: 'cpu=48,gres/gpu=4' --> 4
-    # Example: 'cpu=48,gres/gpu=h100:4' --> 4
-    for part in tres_per_task.split(","):
-        res_type, _, res_count = part.partition("=")
-        if res_type == "gres/gpu":
-            gpus_per_task = int(res_count.rpartition(":")[-1])
-            assert gpus_per_task > 0
-            return gpus_per_task
-    return 0
-
-
-# @hydra.main(config_path="configs", version_base=None)
-def main():
-    gpus_per_task = get_gpus_per_task(os.environ["SLURM_TRES_PER_TASK"])
-    jax.distributed.initialize(local_device_ids=list(range(gpus_per_task)))
-
-    process_index = jax.process_index()
-    if process_index == 0:
-        print(yaml.dump(dataclasses.asdict(config), indent=2))
-
-    if config.training.queue:
-        task = Task.init(project_name="testing", task_name=config.paths.model_name)
-        logger = task.get_logger()
-        task.execute_remotely(queue_name=config.training.queue)
-        task.launch_multi_node(config.num_hosts, wait=True)
-        if int(os.environ["RANK"]) > 0:
-            task.set_system_tags((task.get_system_tags() or []) + ["hidden"])
-
-    else:
-        logger = None
-    main_contained(config, logger)
+            training_io.log(step, None, output)
 
 
 if __name__ == "__main__":

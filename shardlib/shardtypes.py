@@ -257,7 +257,11 @@ def register_with_typeguard():
 
 
 #### Array types
-class number:
+# todo: Why isn't `number` a jax.Array? causes typing errors in all calls to all pytree dataclasses!
+# TODO: WHY isn't this using jaxtyping?
+
+
+class number(jax.Array):
     def __class_getitem__(cls, x):
         if isinstance(x, str):
             x = x.encode("utf-8")
@@ -302,6 +306,7 @@ class u8(number):
 _PYTREE_DATACLASSES = set()
 
 
+@typing.dataclass_transform()
 def pytree_dataclass[T](cls: type[T]) -> type[T]:
     """Decorator that declares a dataclass that JAX recognizes as a PyTree."""
     cls = dataclass(cls)
