@@ -8,4 +8,7 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --time=0-01:00:00
 
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
 srun uv run --offline --frozen --all-extras "$@"
