@@ -762,6 +762,10 @@ def main():
         drop_last=True,
         batch_size=config.hf_dataset.sequences_packed_per_batch,
     )
+    assert isinstance(max_token_id, int)
+    assert config.model.vocab > max_token_id, f"{config.model.vocab} vs {max_token_id}"
+    model_dir = Path(config.paths.root_working_dir) / config.paths.model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
 
     # what is this? Why is it here?
     # maybe this? https://github.com/jax-ml/jax/issues/17982
@@ -773,22 +777,8 @@ def main():
         root_rng = jax.random.PRNGKey(config.training.seed)
         # todo: does this have to be in the mesh context block?
         # loader = get_loader("train", config.training_data, config.training.tokens)
-        assert isinstance(config.training_data, HuggingFaceDataParams)
-        loader = HuggingFaceDataLoader(
-            split="train",
-            config=config.training_data,
-            token_batch_params=config.training.tokens,
-            streaming=False,
-        )
-        assert isinstance(loader.max_token_id, int)
-        assert config.model.vocab > loader.max_token_id, (
-            f"{config.model.vocab} vs {loader.max_token_id}"
-        )
-        model_dir = Path(config.paths.root_working_dir) / config.paths.model_name
-        training_io.mkdir(str(model_dir))
-
-        state = jax.jit(partial(State.init, config.model))(
-            fold_in_str(root_rng, "init")
+        state = jax.jit(State.init, static_argnums=0)(
+            config.model, fold_in_str(root_rng, "init")
         )
         state, start_step = training_io.load_checkpoint_if_it_exists(
             str(model_dir), state, config.io
@@ -817,6 +807,7 @@ def main():
                 training_io.start_profile()
                 profile_start = time.time()
 
+            # TODO: Need to do the equivalent of `loader.load(step)` (which is ugly).
             state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
 
             # Run profile for two steps, to include data loading time in between them.
