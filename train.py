@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from functools import cached_property, partial
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union
+import numpy as np
 
+import datasets
 import einops
 import jax
 import jax.numpy as jnp
@@ -23,6 +25,7 @@ from jax._src.distributed import initialize as jax_distributed_initialize
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, PartitionSpec
 from jax.tree_util import tree_leaves
+import torch
 from typeguard import typechecked
 import yaml
 
@@ -32,6 +35,7 @@ import shardlib.shardtypes as shardtypes
 import training_io
 from input_loader import (
     FlatTokensParams,
+    HuggingFaceDataLoader,
     HuggingFaceDataParams,
     TokenBatch,
     TokenBatchParams,
@@ -622,10 +626,28 @@ def setup_logging(local_rank: int, num_processes: int, verbose: int):
         log.setLevel(logging.DEBUG)
 
 
+def collate_fn(sequences, batch_size: int, max_seq_len: int):
+    flat_batch = np.zeros(batch_size * max_seq_len, np.uint32)
+    flat_is_start = np.zeros(batch_size * max_seq_len, np.bool_)
+    start = 0
+    for seq in sequences:
+        seq = seq["input_ids"][0]
+        end = min(start + len(seq), len(flat_batch))
+        flat_is_start[start] = True
+        flat_batch[start:end] = seq[: end - start]
+        start += len(seq)
+        if start >= len(flat_batch):
+            break
+    shape = (batch_size, max_seq_len)
+    return flat_batch.reshape(shape), flat_is_start.reshape(shape)
+
+
 # todo: the type hints here SUCK. Not using it yet.
 # @auto_config
 # def make_config(world_size: int):
 #     return Config(...)
+
+# TODO: Make this simpler with submitit?
 
 
 def main():
@@ -700,15 +722,64 @@ def main():
         log.info(yaml.dump(dataclasses.asdict(config), indent=2))
         # todo: wandb init here.
 
+    from transformers import AutoTokenizer
+
+    assert config.hf_dataset
+    tokenizer = AutoTokenizer.from_pretrained(config.hf_dataset.tokenizer)
+    batch_size = config.training.tokens.batch
+    max_seq_len = config.training.tokens.len
+    # todo: simplify.
+    sharding = shardtypes.make_shardings(TokenBatch).targets
+    max_token_id = tokenizer.vocab_size - 1
+    assert 0 in tokenizer.all_special_ids, (
+        "Tokenizer must have a special 0 token"  # WHY?
+    )
+
+    # setup an iterator over the dataset
+    tokenize = functools.partial(
+        tokenizer,
+        padding=False,
+        truncation=False,
+        max_length=None,
+        add_special_tokens=False,
+        return_token_type_ids=False,
+        return_attention_mask=False,
+        return_tensors="np",
+    )
+    dataset = datasets.load_dataset(
+        config.hf_dataset.path, config.hf_dataset.name, split="train"
+    )
+    tokenized = dataset.select_columns(["text"]).map(
+        tokenize, input_columns=["text"], remove_columns=["text"]
+    )
+
+    dataloader = torch.utils.data.DataLoader(
+        tokenized,
+        num_workers=config.hf_dataset.num_workers,
+        collate_fn=functools.partial(
+            collate_fn, batch_size=batch_size, max_seq_len=max_seq_len
+        ),
+        drop_last=True,
+        batch_size=config.hf_dataset.sequences_packed_per_batch,
+    )
+
     # what is this? Why is it here?
+    # maybe this? https://github.com/jax-ml/jax/issues/17982
     jax.config.update("jax_threefry_partitionable", True)
     with Mesh(
         mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t], jax.devices()),
         ("d", "t"),
     ):
         root_rng = jax.random.PRNGKey(config.training.seed)
-
-        loader = get_loader("train", config.training_data, config.training.tokens)
+        # todo: does this have to be in the mesh context block?
+        # loader = get_loader("train", config.training_data, config.training.tokens)
+        assert isinstance(config.training_data, HuggingFaceDataParams)
+        loader = HuggingFaceDataLoader(
+            split="train",
+            config=config.training_data,
+            token_batch_params=config.training.tokens,
+            streaming=False,
+        )
         assert isinstance(loader.max_token_id, int)
         assert config.model.vocab > loader.max_token_id, (
             f"{config.model.vocab} vs {loader.max_token_id}"

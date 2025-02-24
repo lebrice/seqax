@@ -356,7 +356,11 @@ class HuggingFaceDataLoader:
     """
 
     def __init__(
-        self, split, config: HuggingFaceDataParams, token_batch_params: TokenBatchParams
+        self,
+        split,
+        config: HuggingFaceDataParams,
+        token_batch_params: TokenBatchParams,
+        streaming: bool = True,
     ):
         self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
         self.batch_size = token_batch_params.batch
@@ -364,7 +368,7 @@ class HuggingFaceDataLoader:
         self.sharding = shardtypes.make_shardings(TokenBatch).targets
         self.max_token_id = self.tokenizer.vocab_size - 1
         assert 0 in self.tokenizer.all_special_ids, (
-            "Tokenizer must have a special 0 token"
+            "Tokenizer must have a special 0 token"  # WHY?
         )
 
         # setup an iterator over the dataset
@@ -378,7 +382,10 @@ class HuggingFaceDataLoader:
             return_attention_mask=False,
             return_tensors="np",
         )
-        dataset = load_dataset(config.path, config.name, streaming=True, split=split)
+        # TODO: Why does it assume `streaming=True`?
+        dataset = load_dataset(
+            config.path, config.name, streaming=streaming, split=split
+        )
         tokenized = dataset.select_columns(["text"]).map(
             tokenize, input_columns=["text"], remove_columns=["text"]
         )
@@ -406,16 +413,20 @@ class HuggingFaceDataLoader:
         shape = (self.batch_size, self.max_seq_len)
         return flat_batch.reshape(shape), flat_is_start.reshape(shape)
 
-    def load(self, step):
+    def load(self, step):  # WHY IS STEP IGNORED?!
         shape = (self.batch_size, self.max_seq_len)
         batch, is_start = next(self.iterator)
 
+        # HUH?!
         def get_shard(x: jax.Array, indexing: Tuple[slice]) -> jax.Array:
             shard = x[indexing]
             return shard
 
         tokens = jax.make_array_from_callback(
-            shape, self.sharding, functools.partial(get_shard, batch)
+            shape,
+            self.sharding,
+            # TODO: Why not something clear like `lambda index: batch[index]` or using operator.getitem?
+            functools.partial(get_shard, batch),
         )
         is_start = jax.make_array_from_callback(
             shape, self.sharding, functools.partial(get_shard, is_start)
