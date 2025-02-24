@@ -1,0 +1,8 @@
+# @package: _global_
+flat_tokens:
+  filespec: "synthetic_dataset.zarr"
+  streams: 2
+  read_blocks_per_shuffle_buffer: 8
+  sequences_per_read_block: 16
+  seed: 0
+  sequence_packing: true

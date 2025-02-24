@@ -7,4 +7,5 @@
 #SBATCH --mem=0
 #SBATCH --cpus-per-task=48
 #SBATCH --time=0-01:00:00
-srun uv run python -m train "$@"
+
+srun uv run --offline --frozen --all-extras "$@"

@@ -4,7 +4,7 @@
 defaults:
   - base
   - _self_
-
+  - dataset/synthetic
 num_hosts: 1
 
 mesh:
@@ -30,7 +30,7 @@ model:
   rope_max_timescale: 256
 
 paths:
-  root_working_dir: "/tmp"
+  root_working_dir: "/scratch/n/normandf/logs"
 
 checkpoint_interval: 10
 

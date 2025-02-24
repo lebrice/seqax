@@ -46,6 +46,7 @@ def log(step: int, logger: Logger, output: PyTree):
             arr = jax.device_get(arr)
             if arr.shape == () and arr.dtype == jnp.float32:
                 if logger:
+                    # todo: adapt for wandb.
                     logger.report_scalar(
                         title=path, series=path, value=arr, iteration=step
                     )
@@ -197,7 +198,7 @@ def save_zarr(filename: str, state: PyTree, config: IOConfig):
         for path, arr in state:
             path = jax.tree_util.keystr(path)
             chunk_shape = arr.sharding.shard_shape(arr.shape)
-            root.empty(path, shape=arr.shape, chunks=chunk_shape, dtype=arr.dtype)
+            root.empty(name=path, shape=arr.shape, chunks=chunk_shape, dtype=arr.dtype)
     multihost_utils.sync_global_devices("save_zarr_begin")
 
     root = zarr.open_group(filename, mode="r+")

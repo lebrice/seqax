@@ -1,9 +1,15 @@
 """Main training loop, including the model, loss function, and optimizer."""
 
+import dataclasses
+import functools
 import operator
 import os
 from pathlib import Path
 import time
+
+import clearml
+import omegaconf
+import yaml
 
 import env
 
@@ -16,7 +22,7 @@ import datetime
 import math
 from dataclasses import dataclass
 from functools import cached_property, partial
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Iterable, Optional, Tuple, Union
 
 import einops
 import hydra
@@ -50,6 +56,13 @@ from shardlib.shardtypes import (
     u32,
 )
 
+
+def multiply(numbers: Iterable[Any]):
+    return functools.reduce(operator.mul, numbers)
+
+
+omegaconf.OmegaConf.register_new_resolver("eval", eval)
+omegaconf.OmegaConf.register_new_resolver("mul", lambda *numbers: multiply(numbers))
 P = PartitionSpec
 PRNGKey = Any
 
@@ -86,7 +99,7 @@ class Model:
     embed: f32["vocab/t d_model/d"]
     unembed: f32["vocab/t d_model/d"]
     transformer: Transformer
-    final_layer_norm: f32["d_model/d/t"]
+    final_layer_norm: f32[" d_model/d/t"]
 
     @staticmethod
     @typechecked
@@ -533,7 +546,7 @@ class Config:
         return self.flat_tokens or self.hf_dataset
 
 
-def main_contained(config: Config, logger):
+def main_contained(config: Config, logger: clearml.Logger | None):
     """Main program, which does not access external services except as specified by config.paths or logger."""
     # Use partitionable (and hopefully fusable!) RNG.
     #
@@ -548,17 +561,18 @@ def main_contained(config: Config, logger):
         root_rng = jax.random.PRNGKey(config.training.seed)
 
         loader = get_loader("train", config.training_data, config.training.tokens)
+        assert isinstance(loader.max_token_id, int)
         assert config.model.vocab > loader.max_token_id, (
             f"{config.model.vocab} vs {loader.max_token_id}"
         )
 
-        model_dir = os.path.join(config.paths.root_working_dir, config.paths.model_name)
-        training_io.mkdir(model_dir)
+        model_dir = Path(config.paths.root_working_dir) / config.paths.model_name
+        training_io.mkdir(str(model_dir))
         state = jax.jit(partial(State.init, config.model))(
             fold_in_str(root_rng, "init")
         )
         state, start_step = training_io.load_checkpoint_if_it_exists(
-            model_dir, state, config.io
+            str(model_dir), state, config.io
         )
 
         # Explicitly compile training step, to record XLA HLO graph.
@@ -575,7 +589,7 @@ def main_contained(config: Config, logger):
 
         for step in range(start_step, config.training.steps):
             if step % config.checkpoint_interval == 0 and step > start_step:
-                training_io.save_checkpoint(model_dir, step, state, config.io)
+                training_io.save_checkpoint(str(model_dir), step, state, config.io)
 
             # We profile on the second step, because the first step has a long pause for XLA
             # compilation and initial shuffle buffer loading.
@@ -609,9 +623,98 @@ def main_contained(config: Config, logger):
             training_io.log(step, logger, output)
 
 
-@hydra.main(config_path="configs", version_base=None)
-def main(config):
-    config = jax_extra.make_dataclass_from_dict(Config, config)
+WORLD_SIZE = int(os.environ["SLURM_JOB_NUM_NODES"]) * int(
+    os.environ["SLURM_NTASKS_PER_NODE"]
+)
+
+config = Config(
+    model=Hparams(
+        d_model=4096,
+        n_q_per_kv=1,
+        n_kv=16,
+        d_head=128,
+        layers=8,
+        d_ff=16384,
+        vocab=32768,
+        rope_max_timescale=10000,
+    ),
+    training=TrainingHparams(
+        # AdamW optimizer parameters
+        # We use AdamW following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
+        adam_b1=0.9,  # Exponential decay rate to track the first moment of past gradients.
+        adam_b2=0.95,  # Exponential decay rate to track the second moment of past gradients.
+        adam_eps=1.0e-8,  # A small constant applied to denominator outside of the square root.
+        adam_eps_root=0.0,  # A small constant applied to denominator inside the square root.
+        weight_decay=0.1,  # AdamW Weight decay
+        # We take inspiration from Llama2's learning rate (LR) schedule, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
+        # Learning rate schedule has two parts:
+        # 1) Linear warmup from 0 to [learning_rate] over steps 0 to [learning_rate_schedule_steps * warmup_steps_fraction]
+        # 2) Cosine decay from [learning_rate] to [learning_rate * cosine_learning_rate_final_fraction] from warmup to learning_rate_schedule_steps
+        # learning_rate=3.e-5,
+        cosine_learning_rate_final_fraction=0.1,
+        seed=0,
+        warmup_steps=18500,
+        steps=185000,
+        steps_for_lr=185000,
+        learning_rate=1.0e-5,
+        tokens=TokenBatchParams(
+            batch=64,
+            len=1024,
+        ),
+        # queue="yes",  # ?
+    ),
+    num_hosts=WORLD_SIZE,
+    paths=Paths(
+        root_working_dir=str(Path(os.environ["SCRATCH"]) / "logs"),
+        model_name=os.environ.get("SLURM_JOB_NAME", "default"),
+    ),
+    mesh=MeshConfig(
+        d=WORLD_SIZE,
+        t=1,
+    ),
+    checkpoint_interval=2500,
+    io=training_io.IOConfig(max_io_threads=1024),
+    hf_dataset=HuggingFaceDataParams(
+        path="wikitext",
+        name="wikitext-103-v1",
+        tokenizer="gpt2",
+        num_workers=48,
+        sequences_packed_per_batch=120,
+    ),
+)
+
+
+def get_gpus_per_task(tres_per_task: str) -> int:
+    """Returns the number of GPUS per task from the SLURM env variables.
+
+    >>> get_gpus_per_task('cpu=48,gres/gpu=4')
+    4
+    >>> get_gpus_per_task('cpu=48,gres/gpu=h100:2')
+    2
+    >>> get_gpus_per_task('cpu=48')
+    0
+    """
+    # todo: figure out how many GPUS per task given the tres_per_task.
+    # Example: 'cpu=48,gres/gpu=4' --> 4
+    # Example: 'cpu=48,gres/gpu=h100:4' --> 4
+    for part in tres_per_task.split(","):
+        res_type, _, res_count = part.partition("=")
+        if res_type == "gres/gpu":
+            gpus_per_task = int(res_count.rpartition(":")[-1])
+            assert gpus_per_task > 0
+            return gpus_per_task
+    return 0
+
+
+# @hydra.main(config_path="configs", version_base=None)
+def main():
+    gpus_per_task = get_gpus_per_task(os.environ["SLURM_TRES_PER_TASK"])
+    jax.distributed.initialize(local_device_ids=list(range(gpus_per_task)))
+
+    process_index = jax.process_index()
+    if process_index == 0:
+        print(yaml.dump(dataclasses.asdict(config), indent=2))
+
     if config.training.queue:
         task = Task.init(project_name="testing", task_name=config.paths.model_name)
         logger = task.get_logger()
@@ -619,11 +722,7 @@ def main(config):
         task.launch_multi_node(config.num_hosts, wait=True)
         if int(os.environ["RANK"]) > 0:
             task.set_system_tags((task.get_system_tags() or []) + ["hidden"])
-        jax.distributed.initialize(
-            os.environ["MASTER_ADDR"] + ":" + os.environ["MASTER_PORT"],
-            num_processes=int(os.environ["WORLD_SIZE"]),
-            process_id=int(os.environ["RANK"]),
-        )
+
     else:
         logger = None
     main_contained(config, logger)
