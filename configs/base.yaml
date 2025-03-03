@@ -11,7 +11,7 @@ training:
   # 1) Linear warmup from 0 to [learning_rate] over steps 0 to [learning_rate_schedule_steps * warmup_steps_fraction]
   # 2) Cosine decay from [learning_rate] to [learning_rate * cosine_learning_rate_final_fraction] from warmup to learning_rate_schedule_steps
   learning_rate: 3.e-5
-  cosine_learning_rate_final_fraction: 0.1 
+  cosine_learning_rate_final_fraction: 0.1
   seed: 0
 
 io:

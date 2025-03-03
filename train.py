@@ -1,8 +1,10 @@
 """Main training loop, including the model, loss function, and optimizer."""
 
+import contextlib
 import dataclasses
 import datetime
 import functools
+import itertools
 import logging
 import math
 import operator
@@ -12,22 +14,25 @@ from dataclasses import dataclass
 from functools import cached_property, partial
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union
-import numpy as np
-
+from torch.utils.data import DataLoader
 import datasets
 import einops
 import jax
 import jax.numpy as jnp
+import numpy as np
 import omegaconf
 import rich.logging
+import torch
+import yaml
 from jax import lax
 from jax._src.distributed import initialize as jax_distributed_initialize
 from jax.experimental import mesh_utils
+from jax.experimental.multihost_utils import sync_global_devices
 from jax.sharding import Mesh, PartitionSpec
 from jax.tree_util import tree_leaves
-import torch
+from transformers import AutoTokenizer
 from typeguard import typechecked
-import yaml
+from transformers import PreTrainedTokenizerFast
 
 import jax_extra
 import shardlib.shardops as shardops
@@ -35,15 +40,18 @@ import shardlib.shardtypes as shardtypes
 import training_io
 from input_loader import (
     FlatTokensParams,
-    HuggingFaceDataLoader,
     HuggingFaceDataParams,
+    ShufflingLoader,
     TokenBatch,
     TokenBatchParams,
-    get_loader,
 )
-from jax_extra import explicit_activation_checkpointing, fold_in_str, save_for_backward
+from jax_extra import (
+    explicit_activation_checkpointing,
+    fold_in_str,
+    make_dataclass_from_dict,
+    save_for_backward,
+)
 from shardlib.shardtypes import (
-    Array,
     bf16,
     bool_,
     f32,
@@ -67,8 +75,11 @@ def multiply(numbers: Iterable[Any]):
     return functools.reduce(operator.mul, numbers)
 
 
-omegaconf.OmegaConf.register_new_resolver("eval", eval)
-omegaconf.OmegaConf.register_new_resolver("mul", lambda *numbers: multiply(numbers))
+omegaconf.OmegaConf.register_new_resolver("int", int, replace=True)
+omegaconf.OmegaConf.register_new_resolver("eval", eval, replace=True)
+omegaconf.OmegaConf.register_new_resolver(
+    "mul", lambda *numbers: multiply(numbers), replace=True
+)
 P = PartitionSpec
 PRNGKey = Any
 
@@ -97,7 +108,7 @@ def get_gpus_per_task(tres_per_task: str) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class SlurmDistributedConfig:
+class SlurmDistributedEnv:
     global_rank: int = dataclasses.field(
         default_factory=lambda: int(os.environ["SLURM_PROCID"])
     )
@@ -118,6 +129,7 @@ class SlurmDistributedConfig:
     )
     gpus_per_task: int = dataclasses.field(
         default_factory=lambda: get_gpus_per_task(os.environ["SLURM_TRES_PER_TASK"])
+        or int(os.environ["SLURM_GPUS_ON_NODE"])
     )
     node_id: int = dataclasses.field(
         default_factory=lambda: int(os.environ["SLURM_NODEID"])
@@ -151,7 +163,19 @@ class TransformerLayer:
     w_down: f32["d_model/d d_ff/t"]
 
 
-Transformer = Array["layers", TransformerLayer]
+@pytree_dataclass
+class Transformer(TransformerLayer):
+    ln1: f32["layers d_model/t/d"]
+    ln2: f32["layers d_model/t/d"]
+    w_q: f32["layers d_model/d n_q_per_kv n_kv/t d_head"]
+    w_kv: f32["layers 2 d_model/d n_kv/t d_head"]
+    w_o: f32["layers d_model/d n_q_per_kv n_kv/t d_head"]
+    w_gate: f32["layers d_model/d d_ff/t"]
+    w_up: f32["layers d_model/d d_ff/t"]
+    w_down: f32["layers d_model/d d_ff/t"]
+
+
+# Transformer = Array["layers", TransformerLayer]
 
 
 @pytree_dataclass
@@ -626,7 +650,7 @@ def setup_logging(local_rank: int, num_processes: int, verbose: int):
         log.setLevel(logging.DEBUG)
 
 
-def collate_fn(sequences, batch_size: int, max_seq_len: int):
+def collate_fn(sequences: dict[str, np.ndarray], batch_size: int, max_seq_len: int):
     flat_batch = np.zeros(batch_size * max_seq_len, np.uint32)
     flat_is_start = np.zeros(batch_size * max_seq_len, np.bool_)
     start = 0
@@ -647,89 +671,43 @@ def collate_fn(sequences, batch_size: int, max_seq_len: int):
 # def make_config(world_size: int):
 #     return Config(...)
 
-# TODO: Make this simpler with submitit?
+
+# TODO: Create a single-node job with only CPUs first to preprocess the dataset,
+# then a multi-node job to train.
 
 
-def main():
-    # Rewrite of `main` / `main_contained`.
-    distributed_config = SlurmDistributedConfig()
-    config = Config(
-        model=Hparams(
-            d_model=4096,
-            n_q_per_kv=1,
-            n_kv=16,
-            d_head=128,
-            layers=8,
-            d_ff=16384,
-            vocab=32768,
-            rope_max_timescale=10000,
-        ),
-        training=TrainingHparams(
-            # AdamW optimizer parameters
-            # We use AdamW following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
-            adam_b1=0.9,  # Exponential decay rate to track the first moment of past gradients.
-            adam_b2=0.95,  # Exponential decay rate to track the second moment of past gradients.
-            adam_eps=1.0e-8,  # A small constant applied to denominator outside of the square root.
-            adam_eps_root=0.0,  # A small constant applied to denominator inside the square root.
-            weight_decay=0.1,  # AdamW Weight decay
-            # We take inspiration from Llama2's learning rate (LR) schedule, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
-            # Learning rate schedule has two parts:
-            # 1) Linear warmup from 0 to [learning_rate] over steps 0 to [learning_rate_schedule_steps * warmup_steps_fraction]
-            # 2) Cosine decay from [learning_rate] to [learning_rate * cosine_learning_rate_final_fraction] from warmup to learning_rate_schedule_steps
-            # learning_rate=3.e-5,
-            cosine_learning_rate_final_fraction=0.1,
-            seed=0,
-            warmup_steps=18500,
-            steps=185000,
-            steps_for_lr=185000,
-            learning_rate=1.0e-5,
-            tokens=TokenBatchParams(
-                batch=64,
-                len=1024,
-            ),
-            # queue="yes",  # ?
-        ),
-        num_hosts=distributed_config.num_tasks,
-        paths=Paths(
-            root_working_dir=str(Path(os.environ["SCRATCH"]) / "logs"),
-            model_name=os.environ.get("SLURM_JOB_NAME", "default"),
-        ),
-        mesh=MeshConfig(
-            # todo: play around with different d/t ratios for a fixed number of GPUs?
-            d=(distributed_config.gpus_per_task * distributed_config.num_tasks),
-            t=1,
-        ),
-        checkpoint_interval=2500,
-        io=training_io.IOConfig(max_io_threads=1024),
-        hf_dataset=HuggingFaceDataParams(
-            path="wikitext",
-            name="wikitext-103-v1",
-            tokenizer="gpt2",
-            num_workers=distributed_config.cpus_per_task,
-            sequences_packed_per_batch=120,
-        ),
-    )
-    assert distributed_config.gpus_per_task > 0, os.environ["SLURM_TRES_PER_TASK"]
-    # Using `jax.distributed.initialize` shows an import warning in VsCode+Pylance saying
-    # it isn't defined there.
-    # BUG: Seems like it's necessary to pass this list otherwise the GPUS aren't split correctly.
-    jax_distributed_initialize(
-        local_device_ids=list(range(distributed_config.gpus_per_task))
-    )
-    setup_logging(distributed_config.global_rank, distributed_config.num_tasks, 3)
-    if distributed_config.global_rank == 0:
-        log.info(yaml.dump(dataclasses.asdict(distributed_config), indent=2))
-        log.info(yaml.dump(dataclasses.asdict(config), indent=2))
-        # todo: wandb init here.
+@contextlib.contextmanager
+def global_main_process_first(*, global_rank: int, name: str = "sync"):
+    if global_rank == 0:
+        yield
+        log.debug(f"Entering '{name}' barrier.")
+        sync_global_devices(name)
+        log.debug(f"Exiting '{name}' barrier.")
+    else:
+        log.debug(f"Entering '{name}' barrier.")
+        sync_global_devices(name)
+        log.debug(f"Exiting '{name}' barrier.")
+        yield
 
-    from transformers import AutoTokenizer
 
+@contextlib.contextmanager
+def local_main_process_first(*, local_rank: int, name: str = "sync"):
+    if local_rank == 0:
+        yield
+        sync_global_devices(name)
+    else:
+        sync_global_devices(name)
+        yield
+
+
+def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv):
     assert config.hf_dataset
-    tokenizer = AutoTokenizer.from_pretrained(config.hf_dataset.tokenizer)
+    log.info(f"Getting pretrained tokenizer {config.hf_dataset.tokenizer}")
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(config.hf_dataset.tokenizer)
     batch_size = config.training.tokens.batch
     max_seq_len = config.training.tokens.len
-    # todo: simplify.
-    sharding = shardtypes.make_shardings(TokenBatch).targets
+    # # todo: simplify, replace with a hard-coded value to start.
+    # sharding = shardtypes.make_shardings(TokenBatch).targets
     max_token_id = tokenizer.vocab_size - 1
     assert 0 in tokenizer.all_special_ids, (
         "Tokenizer must have a special 0 token"  # WHY?
@@ -746,12 +724,30 @@ def main():
         return_attention_mask=False,
         return_tensors="np",
     )
-    dataset = datasets.load_dataset(
-        config.hf_dataset.path, config.hf_dataset.name, split="train"
-    )
-    tokenized = dataset.select_columns(["text"]).map(
-        tokenize, input_columns=["text"], remove_columns=["text"]
-    )
+
+    print("Print before")
+    log.info("before")
+    with global_main_process_first(global_rank=distributed_env.global_rank):
+        print("print Inside")
+        log.debug("Inside")
+
+    with global_main_process_first(
+        global_rank=distributed_env.global_rank,
+    ):
+        print("Loading dataset...")
+        log.info("Loading dataset.")
+        dataset = datasets.load_dataset(
+            config.hf_dataset.path, config.hf_dataset.name, split="train"
+        )
+        print("Tokenizing dataset...")
+        log.info("Tokenizing dataset...")
+        tokenized = dataset.select_columns(["text"]).map(
+            tokenize,
+            input_columns=["text"],
+            remove_columns=["text"],
+            # todo: make sure this is all cached properly.
+            # load_from_cache_file=True,
+        )
 
     dataloader = torch.utils.data.DataLoader(
         tokenized,
@@ -762,75 +758,152 @@ def main():
         drop_last=True,
         batch_size=config.hf_dataset.sequences_packed_per_batch,
     )
+    return dataloader, max_token_id
+
+
+from hydra.core.config_store import ConfigStore
+import hydra
+
+# cs = ConfigStore.instance()
+def dataloader_iter(dataloader: DataLoader, start_step: int, training_steps: int):
+    # Waste some steps to get back to the same state?
+    ...
+
+
+@hydra.main(config_path="configs", version_base="1.2")
+def main(raw_config: omegaconf.DictConfig):
+    distributed_env = SlurmDistributedEnv()
+    config = make_dataclass_from_dict(Config, raw_config)
+    config = dataclasses.replace(
+        config,
+        mesh=MeshConfig(
+            d=distributed_env.num_tasks * distributed_env.gpus_per_task, t=1
+        ),
+    )
+
+    # Rewrite of `main` / `main_contained`.
+    assert distributed_env.gpus_per_task > 0, os.environ["SLURM_TRES_PER_TASK"]
+    # Using `jax.distributed.initialize` shows an import warning in VsCode+Pylance saying
+    # it isn't defined there.
+    # BUG: Seems like it's necessary to pass this list otherwise the GPUS aren't split correctly.
+    jax_distributed_initialize(
+        local_device_ids=list(range(distributed_env.gpus_per_task))
+    )
+    setup_logging(distributed_env.global_rank, distributed_env.num_tasks, 3)
+
+    log.info("Initialized.")
+    if distributed_env.global_rank == 0:
+        print("Distributed Config:")
+        print(yaml.dump(dataclasses.asdict(distributed_env), indent=2))
+        print("Config:")
+        print(yaml.dump(dataclasses.asdict(config), indent=2))
+        # todo: wandb init here.
+
+    # what is this? Why is it here?
+    # maybe this? https://github.com/jax-ml/jax/issues/17982
+    jax.config.update("jax_threefry_partitionable", True)
+    mesh = Mesh(
+        mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t], jax.devices()),
+        ("d", "t"),
+    )
+
+    if config.hf_dataset:
+        dataloader, max_token_id = get_dataloader(config, distributed_env)
+        loader = iter(itertools.repeat(dataloader))
+    else:
+        assert config.flat_tokens
+        log.info(f"Loading flat tokens from {config.flat_tokens.filespec}")
+        loader = ShufflingLoader(
+            "train", config.flat_tokens, config.training.tokens, mesh=mesh
+        )
+        max_token_id = loader.max_token_id
+
     assert isinstance(max_token_id, int)
     assert config.model.vocab > max_token_id, f"{config.model.vocab} vs {max_token_id}"
     model_dir = Path(config.paths.root_working_dir) / config.paths.model_name
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    # what is this? Why is it here?
-    # maybe this? https://github.com/jax-ml/jax/issues/17982
-    jax.config.update("jax_threefry_partitionable", True)
-    with Mesh(
-        mesh_utils.create_device_mesh([config.mesh.d, config.mesh.t], jax.devices()),
-        ("d", "t"),
-    ):
-        root_rng = jax.random.PRNGKey(config.training.seed)
-        # todo: does this have to be in the mesh context block?
-        # loader = get_loader("train", config.training_data, config.training.tokens)
-        state = jax.jit(State.init, static_argnums=0)(
-            config.model, fold_in_str(root_rng, "init")
-        )
-        state, start_step = training_io.load_checkpoint_if_it_exists(
-            str(model_dir), state, config.io
-        )
+    mesh.__enter__()  # hacky, but nicer than indenting all the code below.
+    # TODO: Pass `mesh` as an argument instead of the weird global variable hack
+    # that is happening in shardlib.
 
-        # Explicitly compile training step, to record XLA HLO graph.
-        # See https://bnikolic.co.uk/blog/python/jax/2022/02/22/jax-outputgraph-rev
-        c_training_step = training_step.lower(
-            state, jnp.uint32(0), config.model, config.training, loader.load(0)
-        ).compile()
-        date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        Path(model_dir).mkdir(parents=True, exist_ok=True)
-        training_io.save_hlo_svg(
-            os.path.join(model_dir, f"training_step_optimized_hlo_{date}.svg"),
-            c_training_step,
-        )
+    root_rng = jax.random.PRNGKey(config.training.seed)
+    
+    # todo: does this have to be in the mesh context block?
+    # loader = get_loader("train", config.training_data, config.training.tokens)
+    state = jax.jit(State.init, static_argnums=0)(
+        config.model, fold_in_str(root_rng, "init")
+    )
+    
+    # TODO: Can we just remove this for now? Otherwise we have to save the dataloader state explicitly. 
+    state, start_step = training_io.load_checkpoint_if_it_exists(
+        str(model_dir), state, config.io
+    )
+    log.info(f"Starting training at step {start_step}.")
+    
+    if isinstance(loader, ShufflingLoader):
+        sample_batch = loader.load(0)
+    else:
+        sample_batch = next(loader)
+    
+    # Explicitly compile training step, to record XLA HLO graph.
+    # See https://bnikolic.co.uk/blog/python/jax/2022/02/22/jax-outputgraph-rev
+    c_training_step = training_step.lower(
+        state, jnp.uint32(0), config.model, config.training, sample_batch
+    ).compile()
+    date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
+    training_io.save_hlo_svg(
+        os.path.join(model_dir, f"training_step_optimized_hlo_{date}.svg"),
+        c_training_step,
+    )
+    profile_start = None
 
-        for step in range(start_step, config.training.steps):
-            if step % config.checkpoint_interval == 0 and step > start_step:
-                training_io.save_checkpoint(str(model_dir), step, state, config.io)
+        
 
-            # We profile on the second step, because the first step has a long pause for XLA
-            # compilation and initial shuffle buffer loading.
-            if jax.process_index() == 0 and step == start_step + 1:
-                jax.block_until_ready(state)
-                training_io.start_profile()
-                profile_start = time.time()
 
-            # TODO: Need to do the equivalent of `loader.load(step)` (which is ugly).
-            state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
+    for step in range(start_step, config.training.steps):
+        if step % config.checkpoint_interval == 0 and step > start_step:
+            training_io.save_checkpoint(str(model_dir), step, state, config.io)
 
-            # Run profile for two steps, to include data loading time in between them.
-            if jax.process_index() == 0 and step == start_step + 2:
-                jax.block_until_ready(state)
-                profile_duration = time.time() - profile_start
-                training_io.stop_profile(model_dir)
+        # We profile on the second step, because the first step has a long pause for XLA
+        # compilation and initial shuffle buffer loading.
+        if jax.process_index() == 0 and step == start_step + 1:
+            jax.block_until_ready(state)
+            training_io.start_profile()
+            profile_start = time.time()
 
-                # Print MFU, including (one step of) data loading time.
-                print(f"Profile time: {profile_duration}s for 2 steps.")
-                model_params = jax.tree.reduce(
-                    operator.add, jax.tree.map(lambda w: w.size, state.weights)
-                )
-                tokens = loader.load(step).targets.size
-                print(f"Model params: {model_params:_}")
-                print(f"Tokens: {tokens:_}")
-                device_flops = training_io.get_flops_per_device()
-                num_devices = jax.device_count()
-                print(
-                    f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
-                )
+        # TODO: Need to do the equivalent of `loader.load(step)` with a dataloader.
+        if isinstance(loader, ShufflingLoader):
+            batch = loader.load(step)
+        else:
+            # batch = next(dataloader)
+        
+        state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
 
-            training_io.log(step, None, output)
+        # Run profile for two steps, to include data loading time in between them.
+        if jax.process_index() == 0 and step == start_step + 2:
+            jax.block_until_ready(state)
+            assert profile_start is not None
+            profile_duration = time.time() - profile_start
+            training_io.stop_profile(model_dir)
+
+            # Print MFU, including (one step of) data loading time.
+            print(f"Profile time: {profile_duration}s for 2 steps.")
+            model_params = jax.tree.reduce(
+                operator.add, jax.tree.map(lambda w: w.size, state.weights)
+            )
+            tokens = loader.load(step).targets.size
+            print(f"Model params: {model_params:_}")
+            print(f"Tokens: {tokens:_}")
+            device_flops = training_io.get_flops_per_device()
+            num_devices = jax.device_count()
+            print(
+                f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
+            )
+
+        training_io.log(step, None, output)
+    mesh.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

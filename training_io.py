@@ -5,6 +5,7 @@
 * reporting FLOPs per device
 """
 
+from pathlib import Path
 import shlex
 import subprocess
 import jax
@@ -245,12 +246,13 @@ def start_profile():
     jax.profiler.start_trace(_PROFILE_DIR, create_perfetto_trace=True)
 
 
-def stop_profile(working_dir: str):
+def stop_profile(working_dir: str | Path):
     """Stops gathering the JAX profile and saves it to a file."""
     global _PROFILE_DIR
     jax.profiler.stop_trace()
     print(f"[{datetime.datetime.now()}] Finished profile, copying to {working_dir}")
-    fsspec_put(_PROFILE_DIR + "/", working_dir + "/")
+    assert _PROFILE_DIR is not None
+    fsspec_put(_PROFILE_DIR + "/", str(working_dir) + "/")
     shutil.rmtree(_PROFILE_DIR)
     print(f"[{datetime.datetime.now()}] Finished copying profile to {working_dir}")
     _PROFILE_DIR = None

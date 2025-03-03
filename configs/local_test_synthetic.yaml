@@ -25,6 +25,7 @@ model:
 
 paths:
   root_working_dir: "/scratch/n/normandf/logs"
+  model_name: ???
 
 checkpoint_interval: 10
 num_hosts: 1

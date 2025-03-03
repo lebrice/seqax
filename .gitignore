@@ -163,4 +163,6 @@ cython_debug/
 #.idea/
 
 slurm-*.out
-logs
+logs.schemas
+.schemas
+tools/.schemas

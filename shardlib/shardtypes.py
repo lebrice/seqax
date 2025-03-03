@@ -42,22 +42,26 @@ See for example `typed_shard_map`, which is a simplification of JAX's `shard_map
 of sharding in type signatures.
 """
 
+import dataclasses
 import inspect
 import typing
 from collections.abc import Sequence
 from contextvars import ContextVar
+from dataclasses import dataclass, make_dataclass
 from enum import IntEnum
-from typing import Any, Union
-from typing import get_args, get_origin
-from typeguard import check_type_internal, typechecked
+from types import GenericAlias
+from typing import Any, Union, get_args, get_origin
+
 import jax
 import jax.numpy as jnp
-from types import GenericAlias
-from typeguard import TypeCheckError, TypeCheckerCallable
-import dataclasses
-from dataclasses import dataclass, make_dataclass
-from typeguard import checker_lookup_functions
-
+from jax.sharding import Mesh
+from typeguard import (
+    TypeCheckerCallable,
+    TypeCheckError,
+    check_type_internal,
+    checker_lookup_functions,
+    typechecked,
+)
 
 #### State
 # ContextVar(dict[str, int])
@@ -377,9 +381,9 @@ def make_partition_specs(cls):
     raise ValueError(f"Unsupported type {cls} is not a array, dataclass, or tuple type")
 
 
-def make_shardings(cls):
+def make_shardings(cls, mesh: Mesh | None = None):
     """Instantiates a pytree dataclass with NamedSharding at array type."""
-    mesh = jax._src.mesh.thread_resources.env.physical_mesh
+    mesh = mesh or jax._src.mesh.thread_resources.env.physical_mesh
     return jax.tree_map(
         lambda spec: jax.sharding.NamedSharding(mesh, spec), make_partition_specs(cls)
     )

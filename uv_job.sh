@@ -10,5 +10,7 @@
 
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
+export HF_HOME=$SCRATCH/huggingface
+export HF_HUB_OFFLINE=1
 
 srun uv run --offline --frozen --all-extras "$@"

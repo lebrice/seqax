@@ -35,8 +35,8 @@ import numpy as np
 from jax.sharding import PartitionSpec as P
 import datetime
 import jax
+from jax.sharding import Mesh
 
-# imports for hf dataloader
 import numpy as onp
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
@@ -95,7 +95,11 @@ class _ShuffleBuffer:
 
 class ShufflingLoader:
     def __init__(
-        self, split: str, params: FlatTokensParams, token_batch_params: TokenBatchParams
+        self,
+        split: str,
+        params: FlatTokensParams,
+        token_batch_params: TokenBatchParams,
+        mesh: Mesh,
     ):
         self.params = params
         self.token_batch_params = token_batch_params
@@ -137,7 +141,7 @@ class ShufflingLoader:
             token_batch_params.batch, params.streams
         )
         # Calculate which streams and which batch indices this host is responsible for, based on the sharding.
-        self.sharding = shardtypes.make_shardings(TokenBatch).targets
+        self.sharding = shardtypes.make_shardings(TokenBatch, mesh).targets
         streams = set()
         batch_indices = set()
         for batch_slices, _ in self.sharding.addressable_devices_indices_map(
@@ -187,7 +191,7 @@ class ShufflingLoader:
                 seq_index_in_shuffle_buffer
             ]
 
-        def get_shard(indexing: Tuple[slice]) -> jax.Array:
+        def get_shard(indexing: Tuple[slice, ...]) -> jax.Array:
             seqlen_slice = indexing[1]
             examples = []
             for batch_index in range(

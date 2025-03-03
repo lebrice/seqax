@@ -1,4 +1,5 @@
-# @package: _global_
+# @package _global_
+# todo: use a `dataset` config group instead!
 flat_tokens:
   filespec: "synthetic_dataset.zarr"
   streams: 2
