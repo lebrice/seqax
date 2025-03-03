@@ -8,7 +8,7 @@ defaults:
 
 # _target_: train.Config
 
-num_hosts: ${int:${oc.env:SLURM_NTASKS}}
+num_hosts: ${int:${oc.env:SLURM_NTASKS,1}}
 mesh:
   d: ${num_hosts}
   t: 1

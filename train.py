@@ -4,9 +4,11 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import hashlib
 import itertools
 import logging
 import math
+from multiprocessing import parent_process
 import operator
 import os
 import time
@@ -62,7 +64,7 @@ from shardlib.shardtypes import (
 # NOTE: Removed this. Seems to be specific to TPUs (who even has those except Google?!)
 # import env
 # env.set_variables()  # noqa
-
+SCRATCH = Path(os.environ["SCRATCH"])
 
 # TODO: Double-check that we can get away with adding this here.
 shardtypes.register_with_typeguard()  # noqa
@@ -699,18 +701,26 @@ def local_main_process_first(*, local_rank: int, name: str = "sync"):
         yield
 
 
-def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv | None):
-    assert config.hf_dataset
-    log.info(f"Getting pretrained tokenizer {config.hf_dataset.tokenizer}")
-    tokenizer = PreTrainedTokenizerFast.from_pretrained(config.hf_dataset.tokenizer)
-    batch_size = config.training.tokens.batch
-    max_seq_len = config.training.tokens.len
-    # # todo: simplify, replace with a hard-coded value to start.
-    # sharding = shardtypes.make_shardings(TokenBatch).targets
+def get_tokenized_dataset(dataset_config: HuggingFaceDataParams, data_dir: Path):
+    dataset_config_hash = hashlib.md5(str(dataset_config).encode()).hexdigest()
+    tokenized_path = data_dir / f"tokenized_dataset_{dataset_config_hash}"
+    log.debug(f"Dataset config: {dataset_config}")
+
+    log.info(f"Getting pretrained tokenizer {dataset_config.tokenizer}")
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(dataset_config.tokenizer)
     max_token_id = tokenizer.vocab_size - 1
-    assert 0 in tokenizer.all_special_ids, (
-        "Tokenizer must have a special 0 token"  # WHY?
-    )
+
+    num_proc = len(os.sched_getaffinity(0))
+
+    if tokenized_path.exists():
+        log.info(f"Using pre-tokenized dataset from {tokenized_path}")
+        tokenized_dataset = datasets.load_from_disk(str(tokenized_path))
+        return tokenized_dataset, max_token_id
+
+    log.info(f"Tokenized dataset not found at {tokenized_path}.")
+
+    # TOOD: WHY is this necessary?
+    assert 0 in tokenizer.all_special_ids, "Tokenizer must have a special 0 token"
 
     # setup an iterator over the dataset
     tokenize = functools.partial(
@@ -724,37 +734,46 @@ def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv | None):
         return_tensors="np",
     )
 
-    print("Print before")
-    log.info("before")
-    with (
-        global_main_process_first(global_rank=distributed_env.global_rank)
-        if distributed_env
-        else contextlib.nullcontext()
-    ):
-        print("print Inside")
-        log.debug("Inside")
+    log.info("Loading dataset.")
+    dataset = datasets.load_dataset(
+        dataset_config.path, dataset_config.name, split="train", num_proc=num_proc
+    )
+    log.info("Tokenizing dataset...")
+    dataset = dataset.select_columns(["text"])
+
+    assert isinstance(dataset, datasets.arrow_dataset.Dataset), type(dataset)
+    tokenized_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tokenized_dataset = dataset.map(
+        tokenize,
+        input_columns=["text"],
+        remove_columns=["text"],
+        # todo: make sure this is all cached properly.
+        cache_file_name=str(tokenized_path.with_suffix(".cache")),
+        load_from_cache_file=True,
+        num_proc=num_proc,
+    )
+    # TODO: Do this in a smart, distributed, multi-node fashion somehow?
+    tokenized_dataset.save_to_disk(str(tokenized_path))
+    return tokenized_dataset, max_token_id
+
+
+def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv | None):
+    assert config.hf_dataset
 
     with (
         global_main_process_first(global_rank=distributed_env.global_rank)
         if distributed_env
         else contextlib.nullcontext()
     ):
-        log.info("Loading dataset.")
-        dataset = datasets.load_dataset(
-            config.hf_dataset.path, config.hf_dataset.name, split="train"
+        tokenized, max_token_id = get_tokenized_dataset(
+            config.hf_dataset, data_dir=SCRATCH / "data"
         )
-        log.info("Tokenizing dataset...")
-        tokenized = dataset.select_columns(["text"])
 
-        assert isinstance(tokenized, datasets.DatasetDict)
-        tokenized.map(
-            tokenize,
-            input_columns=["text"],
-            remove_columns=["text"],
-            # todo: make sure this is all cached properly.
-            load_from_cache_file=True,
-            num_proc=len(os.sched_getaffinity(0)),
-        )
+    batch_size = config.training.tokens.batch
+    max_seq_len = config.training.tokens.len
+    # # todo: simplify, replace with a hard-coded value to start.
+    # sharding = shardtypes.make_shardings(TokenBatch).targets
 
     dataloader = torch.utils.data.DataLoader(
         tokenized,
