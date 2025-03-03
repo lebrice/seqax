@@ -1,0 +1,31 @@
+# XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000
+
+defaults:
+  - base
+  - dataset: synthetic
+  - model: 2b
+  - _self_
+
+# _target_: train.Config
+
+num_hosts: ${int:${oc.env:SLURM_NTASKS}}
+mesh:
+  d: ${num_hosts}
+  t: 1
+
+training:
+  _target_: train.TrainingHparams
+  warmup_steps: 18500
+  steps: 185000
+  steps_for_lr: 185000
+  learning_rate: 1.0e-5
+  tokens:
+    batch: 256
+    len: 1024
+
+checkpoint_interval: 2500
+
+paths:
+  _target_: train.Paths
+  root_working_dir: "${oc.env:SCRATCH}/logs"
+  model_name: ${oc.env:SLURM_JOB_NAME,default}

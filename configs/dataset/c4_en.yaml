@@ -1,0 +1,8 @@
+# @package _global_
+hf_dataset:
+  _target_: input_loader.HuggingFaceDataParams
+  path: allenai/c4
+  name: en
+  num_workers: 64
+  tokenizer: mistralai/Mistral-7B-v0.1 # may require huggingface-cli login
+  sequences_packed_per_batch: 120
