@@ -821,6 +821,7 @@ def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv | None):
 def main(raw_config: omegaconf.DictConfig):
     distributed_env = SlurmDistributedEnv()
     config: Config = instantiate(raw_config)
+
     # this apparently doesn't work (the configs are instantiated as
     # train.Config), which is somehow not the same as `Config`?
 
@@ -886,6 +887,7 @@ def main(raw_config: omegaconf.DictConfig):
 
     assert isinstance(max_token_id, int)
     assert config.model.vocab > max_token_id, f"{config.model.vocab} vs {max_token_id}"
+
     model_dir = Path(config.paths.root_working_dir) / config.paths.model_name
     model_dir.mkdir(parents=True, exist_ok=True)
 

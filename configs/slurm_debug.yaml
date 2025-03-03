@@ -30,4 +30,4 @@ checkpoint_interval: 2500
 paths:
   _target_: __main__.Paths
   root_working_dir: "${oc.env:SCRATCH}/logs"
-  model_name: ${oc.env:SLURM_JOB_NAME,default}
+  model_name: "${hydra:job.name}"
