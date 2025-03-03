@@ -1,0 +1,9 @@
+_target_: __main__.TrainingHparams
+warmup_steps: 18500
+steps: 185000
+steps_for_lr: 185000
+learning_rate: 1.0e-5
+tokens:
+  _target_: input_loader.TokenBatchParams
+  batch: 256
+  len: 1024

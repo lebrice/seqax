@@ -15,6 +15,9 @@ from typing import Tuple, Any
 from dataclasses import dataclass
 import os
 import fsspec
+import wandb
+from wandb.wandb_run import Run
+
 import zarr
 from numcodecs import blosc
 from clearml import Logger
@@ -38,7 +41,7 @@ class IOConfig:
     max_io_threads: int
 
 
-def log(step: int, logger: Logger, output: PyTree):
+def log(step: int, logger: Logger | Run | None, output: PyTree):
     """Logs the output of a training step. The output must be a PyTree of f32 arrays."""
     if jax.process_index() == 0:
         metrics_dict = {}
@@ -46,17 +49,21 @@ def log(step: int, logger: Logger, output: PyTree):
             path = jax.tree_util.keystr(path)
             arr = jax.device_get(arr)
             if arr.shape == () and arr.dtype == jnp.float32:
-                if logger:
-                    # todo: adapt for wandb.
+                # todo: adapt for wandb.
+                if isinstance(logger, Logger):
                     logger.report_scalar(
                         title=path, series=path, value=arr, iteration=step
                     )
+                elif logger:
+                    wandb.log({path: arr}, step=step)
                 metrics_dict[path] = float(arr)
             elif arr.dtype == jnp.float32:
-                if logger:
+                if isinstance(logger, Logger):
                     logger.report_histogram(
                         title=path, series=path, values=arr, iteration=step
                     )
+                elif logger:
+                    wandb.log({path: arr}, step=step)
             else:
                 raise ValueError(
                     f"Output {path} has unsupported shape {arr.shape} and dtype {arr.dtype}."

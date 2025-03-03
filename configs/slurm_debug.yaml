@@ -4,35 +4,30 @@ defaults:
   - base
   - dataset: synthetic
   - model: 2b
+  - training: 185k
+  - logger: wandb
   - _self_
 
-# _target_: train.Config
-
+_target_: __main__.Config
 num_hosts: ${int:${oc.env:SLURM_NTASKS,1}}
 mesh:
+  _target_: __main__.MeshConfig
   d: ${num_hosts}
   t: 1
 
+# seems like the batch size per node is 64. Might need to increase this.
 training:
-  _target_: train.TrainingHparams
-
-  warmup_steps: 10
-  steps: 50
-  steps_for_lr: 100
-  tokens:
-    batch: 64
-    len: 64
   # warmup_steps: 18500
   # steps: 185000
   # steps_for_lr: 185000
   # learning_rate: 1.0e-5
-  # tokens:
-  #   batch: 256
-  #   len: 1024
+  tokens:
+    batch: 64
+    # len: 1024
 
 checkpoint_interval: 2500
 
 paths:
-  _target_: train.Paths
+  _target_: __main__.Paths
   root_working_dir: "${oc.env:SCRATCH}/logs"
   model_name: ${oc.env:SLURM_JOB_NAME,default}

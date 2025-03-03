@@ -8,22 +8,26 @@ import hashlib
 import itertools
 import logging
 import math
-from multiprocessing import parent_process
 import operator
 import os
 import time
+from hydra_zen import hydrated_dataclass
+
 from dataclasses import dataclass
 from functools import cached_property, partial
 from pathlib import Path
-from typing import Any, Iterable, Optional, Tuple, Union
+from typing import Any, Iterable, Optional, Tuple
 import datasets
 import einops
+import hydra_zen
 import jax
 import jax.numpy as jnp
 import numpy as np
 import omegaconf
 import rich.logging
 import torch
+import wandb
+import wandb.wandb_run
 import yaml
 from jax import lax
 from jax._src.distributed import initialize as jax_distributed_initialize
@@ -52,6 +56,7 @@ from jax_extra import (
     make_dataclass_from_dict,
     save_for_backward,
 )
+from hydra.utils import instantiate
 from shardlib.shardtypes import (
     bf16,
     bool_,
@@ -608,6 +613,16 @@ class MeshConfig:
     t: int
 
 
+@hydrated_dataclass(
+    wandb.init, frozen=True, zen_partial=True, populate_full_signature=True
+)
+class WandbConfig:
+    # entity: str
+    # project: str
+    # run_name: str
+    group: str = os.environ["SLURM_JOB_ID"]
+
+
 @dataclass(frozen=True)
 class Config:
     model: Hparams
@@ -617,8 +632,13 @@ class Config:
     checkpoint_interval: int
     mesh: MeshConfig
     io: training_io.IOConfig
-    flat_tokens: Optional[FlatTokensParams] = None
-    hf_dataset: Optional[HuggingFaceDataParams] = None
+
+    dataset: FlatTokensParams | HuggingFaceDataParams
+
+    logger: WandbConfig | None = dataclasses.field(default_factory=WandbConfig)
+
+    # flat_tokens: Optional[FlatTokensParams] = None
+    # hf_dataset: Optional[HuggingFaceDataParams] = None
 
     def __post_init__(self):
         assert self.flat_tokens is not None or self.hf_dataset is not None, (
@@ -628,9 +648,17 @@ class Config:
             "Should not specify both flat_tokens and hf_dataset."
         )
 
+    @property
+    def flat_tokens(self) -> FlatTokensParams | None:
+        return self.dataset if isinstance(self.dataset, FlatTokensParams) else None
+
+    @property
+    def hf_dataset(self) -> HuggingFaceDataParams | None:
+        return self.dataset if isinstance(self.dataset, HuggingFaceDataParams) else None
+
     @cached_property
-    def training_data(self) -> Union[FlatTokensParams, HuggingFaceDataParams]:
-        return self.flat_tokens or self.hf_dataset
+    def training_data(self):
+        return self.dataset
 
 
 def setup_logging(local_rank: int, num_processes: int, verbose: int):
@@ -639,6 +667,7 @@ def setup_logging(local_rank: int, num_processes: int, verbose: int):
         # Add the [{local_rank}/{num_processes}] prefix to log messages
         format=f"[%(asctime)s][%(levelname)s][{local_rank + 1}/{num_processes}] %(message)s",
         handlers=[rich.logging.RichHandler()],
+        force=True,
     )
     if verbose == 0:
         log.setLevel(logging.ERROR)
@@ -790,13 +819,33 @@ def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv | None):
 @hydra.main(config_path="configs", version_base="1.2")
 def main(raw_config: omegaconf.DictConfig):
     distributed_env = SlurmDistributedEnv()
-    config = make_dataclass_from_dict(Config, raw_config)
+    config: Config = instantiate(raw_config)
+    # this apparently doesn't work (the configs are instantiated as
+    # train.Config), which is somehow not the same as `Config`?
+
+    assert isinstance(config, Config), (config, type(config), Config)
+    # BUG: Weird Hydra bug, this somehow isn't correct?! (train.Config vs __main__.Config)
+    # todo: This is super weird.
+    # config = make_dataclass_from_dict(Config, raw_config)
+
+    # todo: Play around with different d / t ratios.
     config = dataclasses.replace(
         config,
         mesh=MeshConfig(
             d=distributed_env.num_tasks * distributed_env.gpus_per_task, t=1
         ),
     )
+    setup_logging(distributed_env.global_rank, distributed_env.num_tasks, 3)
+
+    if config.logger:
+        # assert isinstance(config.logger, functools.partial), config.logger
+        wandb_logger = hydra_zen.instantiate(config.logger)
+        # assert isinstance(wandb_logger, wandb.wandb_run.Run)
+        assert isinstance(wandb_logger, functools.partial)
+        wandb_logger = wandb_logger()
+        assert isinstance(wandb_logger, wandb.wandb_run.Run)
+    else:
+        wandb_logger = None
 
     # Rewrite of `main` / `main_contained`.
     assert distributed_env.gpus_per_task > 0, os.environ["SLURM_TRES_PER_TASK"]
@@ -806,7 +855,6 @@ def main(raw_config: omegaconf.DictConfig):
     jax_distributed_initialize(
         local_device_ids=list(range(distributed_env.gpus_per_task))
     )
-    setup_logging(distributed_env.global_rank, distributed_env.num_tasks, 3)
 
     log.info("Initialized.")
     if distributed_env.global_rank == 0:
@@ -889,7 +937,8 @@ def main(raw_config: omegaconf.DictConfig):
 
         # TODO: Need to do the equivalent of `loader.load(step)` with a dataloader.
         if isinstance(loader, ShufflingLoader):
-            batch = loader.load(step)
+            # trick to allow repeating the dataset. Apparently not supported?!
+            batch = loader.load(step % loader.step_count)
         else:
             batch = next(loader)
 
@@ -907,7 +956,8 @@ def main(raw_config: omegaconf.DictConfig):
             model_params = jax.tree.reduce(
                 operator.add, jax.tree.map(lambda w: w.size, state.weights)
             )
-            tokens = loader.load(step).targets.size
+            assert isinstance(loader, ShufflingLoader)
+            tokens = loader.load(step % loader.step_count).targets.size
             print(f"Model params: {model_params:_}")
             print(f"Tokens: {tokens:_}")
             device_flops = training_io.get_flops_per_device()
@@ -916,7 +966,7 @@ def main(raw_config: omegaconf.DictConfig):
                 f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
             )
 
-        training_io.log(step, None, output)
+        training_io.log(step=step, logger=wandb_logger, output=output)
     mesh.__exit__(None, None, None)
 
 

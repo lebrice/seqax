@@ -1,0 +1,3 @@
+_target_: __main__.WandbConfig
+group: ${oc.env:SLURM_JOB_ID}
+mode: offline

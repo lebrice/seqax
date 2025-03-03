@@ -1,9 +1,7 @@
-# @package _global_
-# todo: use a `dataset` config group instead!
-flat_tokens:
-  filespec: "synthetic_dataset.zarr"
-  streams: 2
-  read_blocks_per_shuffle_buffer: 8
-  sequences_per_read_block: 16
-  seed: 0
-  sequence_packing: true
+_target_: input_loader.FlatTokensParams
+filespec: "synthetic_dataset.zarr"
+streams: 2
+read_blocks_per_shuffle_buffer: 8
+sequences_per_read_block: 16
+seed: 0
+sequence_packing: true

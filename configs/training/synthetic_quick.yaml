@@ -1,0 +1,7 @@
+_target_: __main__.TrainingHparams
+warmup_steps: 10
+steps: 50
+steps_for_lr: 100
+tokens:
+  batch: 64
+  len: 64
