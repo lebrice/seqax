@@ -166,3 +166,4 @@ slurm-*.out
 logs.schemas
 .schemas
 tools/.schemas
+.wandb

@@ -620,6 +620,7 @@ class WandbConfig:
     # entity: str
     # project: str
     # run_name: str
+    id: str = f"{os.environ['SLURM_JOB_ID']}_{os.environ['SLURM_PROCID']}"
     group: str = os.environ["SLURM_JOB_ID"]
 
 
