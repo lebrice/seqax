@@ -15,13 +15,20 @@ mesh:
 
 training:
   _target_: train.TrainingHparams
-  warmup_steps: 18500
-  steps: 185000
-  steps_for_lr: 185000
-  learning_rate: 1.0e-5
+
+  warmup_steps: 10
+  steps: 50
+  steps_for_lr: 100
   tokens:
-    batch: 256
-    len: 1024
+    batch: 64
+    len: 64
+  # warmup_steps: 18500
+  # steps: 185000
+  # steps_for_lr: 185000
+  # learning_rate: 1.0e-5
+  # tokens:
+  #   batch: 256
+  #   len: 1024
 
 checkpoint_interval: 2500
 

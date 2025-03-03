@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from functools import cached_property, partial
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple, Union
-from torch.utils.data import DataLoader
 import datasets
 import einops
 import jax
@@ -30,7 +29,6 @@ from jax.experimental import mesh_utils
 from jax.experimental.multihost_utils import sync_global_devices
 from jax.sharding import Mesh, PartitionSpec
 from jax.tree_util import tree_leaves
-from transformers import AutoTokenizer
 from typeguard import typechecked
 from transformers import PreTrainedTokenizerFast
 
@@ -45,6 +43,7 @@ from input_loader import (
     TokenBatch,
     TokenBatchParams,
 )
+import hydra
 from jax_extra import (
     explicit_activation_checkpointing,
     fold_in_str,
@@ -700,7 +699,7 @@ def local_main_process_first(*, local_rank: int, name: str = "sync"):
         yield
 
 
-def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv):
+def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv | None):
     assert config.hf_dataset
     log.info(f"Getting pretrained tokenizer {config.hf_dataset.tokenizer}")
     tokenizer = PreTrainedTokenizerFast.from_pretrained(config.hf_dataset.tokenizer)
@@ -727,26 +726,34 @@ def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv):
 
     print("Print before")
     log.info("before")
-    with global_main_process_first(global_rank=distributed_env.global_rank):
+    with (
+        global_main_process_first(global_rank=distributed_env.global_rank)
+        if distributed_env
+        else contextlib.nullcontext()
+    ):
         print("print Inside")
         log.debug("Inside")
 
-    with global_main_process_first(
-        global_rank=distributed_env.global_rank,
+    with (
+        global_main_process_first(global_rank=distributed_env.global_rank)
+        if distributed_env
+        else contextlib.nullcontext()
     ):
-        print("Loading dataset...")
         log.info("Loading dataset.")
         dataset = datasets.load_dataset(
             config.hf_dataset.path, config.hf_dataset.name, split="train"
         )
-        print("Tokenizing dataset...")
         log.info("Tokenizing dataset...")
-        tokenized = dataset.select_columns(["text"]).map(
+        tokenized = dataset.select_columns(["text"])
+
+        assert isinstance(tokenized, datasets.DatasetDict)
+        tokenized.map(
             tokenize,
             input_columns=["text"],
             remove_columns=["text"],
             # todo: make sure this is all cached properly.
-            # load_from_cache_file=True,
+            load_from_cache_file=True,
+            num_proc=len(os.sched_getaffinity(0)),
         )
 
     dataloader = torch.utils.data.DataLoader(
@@ -759,15 +766,6 @@ def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv):
         batch_size=config.hf_dataset.sequences_packed_per_batch,
     )
     return dataloader, max_token_id
-
-
-from hydra.core.config_store import ConfigStore
-import hydra
-
-# cs = ConfigStore.instance()
-def dataloader_iter(dataloader: DataLoader, start_step: int, training_steps: int):
-    # Waste some steps to get back to the same state?
-    ...
 
 
 @hydra.main(config_path="configs", version_base="1.2")
@@ -828,24 +826,24 @@ def main(raw_config: omegaconf.DictConfig):
     # that is happening in shardlib.
 
     root_rng = jax.random.PRNGKey(config.training.seed)
-    
+
     # todo: does this have to be in the mesh context block?
     # loader = get_loader("train", config.training_data, config.training.tokens)
     state = jax.jit(State.init, static_argnums=0)(
         config.model, fold_in_str(root_rng, "init")
     )
-    
-    # TODO: Can we just remove this for now? Otherwise we have to save the dataloader state explicitly. 
+
+    # TODO: Can we just remove this for now? Otherwise we have to save the dataloader state explicitly.
     state, start_step = training_io.load_checkpoint_if_it_exists(
         str(model_dir), state, config.io
     )
     log.info(f"Starting training at step {start_step}.")
-    
+
     if isinstance(loader, ShufflingLoader):
         sample_batch = loader.load(0)
     else:
         sample_batch = next(loader)
-    
+
     # Explicitly compile training step, to record XLA HLO graph.
     # See https://bnikolic.co.uk/blog/python/jax/2022/02/22/jax-outputgraph-rev
     c_training_step = training_step.lower(
@@ -858,9 +856,6 @@ def main(raw_config: omegaconf.DictConfig):
         c_training_step,
     )
     profile_start = None
-
-        
-
 
     for step in range(start_step, config.training.steps):
         if step % config.checkpoint_interval == 0 and step > start_step:
@@ -877,9 +872,9 @@ def main(raw_config: omegaconf.DictConfig):
         if isinstance(loader, ShufflingLoader):
             batch = loader.load(step)
         else:
-            # batch = next(dataloader)
-        
-        state, output = c_training_step(state, jnp.uint32(step), loader.load(step))
+            batch = next(loader)
+
+        state, output = c_training_step(state, jnp.uint32(step), batch)
 
         # Run profile for two steps, to include data loading time in between them.
         if jax.process_index() == 0 and step == start_step + 2:
