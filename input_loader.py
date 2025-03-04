@@ -126,7 +126,7 @@ class ShufflingLoader:
         assert read_block_count > 0, (
             "Must have at least one read block per stream. Try shrinking streams and sequences_per_read_block."
         )
-        self.step_count = (
+        self.step_count: int = (
             read_block_count * params.sequences_per_read_block
         ) // token_batch_params.batch
         # Count minipochs

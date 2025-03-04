@@ -16,7 +16,7 @@ from hydra_zen import hydrated_dataclass
 from dataclasses import dataclass
 from functools import cached_property, partial
 from pathlib import Path
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Generator, Iterable, Optional, Tuple
 import datasets
 import einops
 import hydra_zen
@@ -38,6 +38,7 @@ from jax.tree_util import tree_leaves
 from typeguard import typechecked
 from transformers import PreTrainedTokenizerFast
 
+import input_loader
 import jax_extra
 import shardlib.shardops as shardops
 import shardlib.shardtypes as shardtypes
@@ -694,7 +695,10 @@ def collate_fn(sequences: dict[str, np.ndarray], batch_size: int, max_seq_len: i
         if start >= len(flat_batch):
             break
     shape = (batch_size, max_seq_len)
-    return flat_batch.reshape(shape), flat_is_start.reshape(shape)
+
+    return input_loader.TokenBatch(
+        targets=flat_batch.reshape(shape), is_seq_start=flat_is_start.reshape(shape)
+    )
 
 
 # todo: the type hints here SUCK. Not using it yet.
@@ -817,6 +821,12 @@ def get_dataloader(config: Config, distributed_env: SlurmDistributedEnv | None):
     return dataloader, max_token_id
 
 
+def cycle[T](iterable: torch.utils.data.DataLoader[T]) -> Generator[T, None, None]:
+    while True:
+        for batch in iterable:
+            yield batch
+
+
 @hydra.main(config_path="configs", version_base="1.2")
 def main(raw_config: omegaconf.DictConfig):
     distributed_env = SlurmDistributedEnv()
@@ -876,7 +886,8 @@ def main(raw_config: omegaconf.DictConfig):
 
     if config.hf_dataset:
         dataloader, max_token_id = get_dataloader(config, distributed_env)
-        loader = iter(itertools.repeat(dataloader))
+        # todo: cycle through the dataloader multiple times.
+        loader = cycle(dataloader)
     else:
         assert config.flat_tokens
         log.info(f"Loading flat tokens from {config.flat_tokens.filespec}")
@@ -938,11 +949,11 @@ def main(raw_config: omegaconf.DictConfig):
             training_io.start_profile()
             profile_start = time.time()
 
-        # TODO: Need to do the equivalent of `loader.load(step)` with a dataloader.
         if isinstance(loader, ShufflingLoader):
             # trick to allow repeating the dataset. Apparently not supported?!
             batch = loader.load(step % loader.step_count)
         else:
+            # TODO: Need to do the equivalent of `loader.load(step)` with a dataloader.
             batch = next(loader)
 
         state, output = c_training_step(state, jnp.uint32(step), batch)
@@ -959,15 +970,16 @@ def main(raw_config: omegaconf.DictConfig):
             model_params = jax.tree.reduce(
                 operator.add, jax.tree.map(lambda w: w.size, state.weights)
             )
-            assert isinstance(loader, ShufflingLoader)
-            tokens = loader.load(step % loader.step_count).targets.size
             print(f"Model params: {model_params:_}")
-            print(f"Tokens: {tokens:_}")
             device_flops = training_io.get_flops_per_device()
             num_devices = jax.device_count()
-            print(
-                f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
-            )
+
+            if isinstance(loader, ShufflingLoader):
+                tokens = loader.load(step % loader.step_count).targets.size
+                print(f"Tokens: {tokens:_}")
+                print(
+                    f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
+                )
 
         training_io.log(step=step, logger=wandb_logger, output=output)
     mesh.__exit__(None, None, None)

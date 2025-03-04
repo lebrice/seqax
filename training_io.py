@@ -17,6 +17,7 @@ import os
 import fsspec
 import wandb
 from wandb.wandb_run import Run
+import zarr.storage
 
 import zarr
 from numcodecs import blosc
